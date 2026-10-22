@@ -1,0 +1,9 @@
+[package]
+name = "rag-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+shared-types.workspace = true

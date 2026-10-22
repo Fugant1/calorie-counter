@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared-types",
+    "crates/db-postgres",
+    "crates/agent-harness",
+    "crates/agent-graph",
+    "crates/audio-whisper",
+    "crates/memory-engine",
+    "crates/rag-search",
+    "crates/queue-workers",
+    "crates/api-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Calorie-Counter AI Contributors"]
+
+[workspace.dependencies]
+async-trait = "0.1"
+hex = "0.4"
+indexmap = { version = "2.14", features = ["serde"] }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde"] }
+tokio = { version = "1.53", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1.24", features = ["v4", "serde"] }
+
+shared-types = { path = "crates/shared-types" }
+agent-harness = { path = "crates/agent-harness" }
+agent-graph = { path = "crates/agent-graph" }
+audio-whisper = { path = "crates/audio-whisper" }
+memory-engine = { path = "crates/memory-engine" }
+rag-search = { path = "crates/rag-search" }
+db-postgres = { path = "crates/db-postgres" }
+queue-workers = { path = "crates/queue-workers" }

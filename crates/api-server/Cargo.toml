@@ -1,0 +1,10 @@
+[package]
+name = "api-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-graph.workspace = true
+agent-harness.workspace = true
+shared-types.workspace = true
