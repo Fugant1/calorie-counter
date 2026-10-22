@@ -39,7 +39,13 @@ version = "0.1.0"
 dependencies = [
  "agent-graph",
  "agent-harness",
+ "db-postgres",
+ "hex",
+ "memory-engine",
+ "serde",
+ "serde_json",
  "shared-types",
+ "tokio",
 ]
 
 [[package]]
@@ -117,8 +123,12 @@ dependencies = [
 name = "db-postgres"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serde",
+ "serde_json",
  "shared-types",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -258,8 +268,12 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "memory-engine"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serde",
+ "serde_json",
  "shared-types",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -427,8 +441,11 @@ dependencies = [
 name = "shared-types"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
+ "thiserror",
  "uuid",
 ]
 

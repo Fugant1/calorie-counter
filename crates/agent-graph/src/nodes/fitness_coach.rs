@@ -120,6 +120,10 @@ impl AgentNode for FitnessCoachNode {
                         entity.display_name, macros_100g.calories_kcal
                     ),
                     macros_per_100g: macros_100g.clone(),
+                    household_measures_grams:
+                        WebResearcherNode::resolve_ground_truth_household_measures(
+                            &entity.canonical_key,
+                        ),
                     embedding: compute_deterministic_embedding(&entity.canonical_key),
                     relevance_score: 0.90,
                 };
@@ -192,14 +196,37 @@ impl AgentNode for FitnessCoachNode {
             DetectedLanguage::English => "Nutrition & Coaching Analysis",
         };
 
+        let mut memory_context_parts = Vec::new();
+        if let Some(plan_title) = profile.get("active_plan_title") {
+            memory_context_parts.push(format!("Plano Ativo: {}", plan_title));
+        }
+        if let Some(hydration) = profile.get("hydration_target_ml") {
+            memory_context_parts.push(format!("Hidratação: {} ml/dia", hydration));
+        }
+        if let Some(probable) = profile.get("probable_daily_foods") {
+            let preview: String = probable.chars().take(180).collect();
+            memory_context_parts.push(format!("Alimentos do Plano: {}", preview));
+        }
+        let episodes = ctx.memory_store.get_episodic_events(&state.user_id);
+        if let Some(last_episode) = episodes.last() {
+            memory_context_parts.push(format!("Memória Episódica Recente: {}", last_episode));
+        }
+
+        let memory_suffix = if memory_context_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" | Memória do Agente: [{}]", memory_context_parts.join(" ; "))
+        };
+
         state.coaching_notes = Some(format!(
-            "{} (Nutrition & Coaching Analysis): [{}] | Meta/Target: {} kcal ({}g protein) | Consumido Hoje/Logged Today: {:.1} kcal ({:.1}g protein) | {}",
+            "{} (Nutrition & Coaching Analysis): [{}] | Meta/Target: {} kcal ({}g protein) | Consumido Hoje/Logged Today: {:.1} kcal ({:.1}g protein){} | {}",
             header,
             facts_summary,
             target_kcal,
             target_protein,
             daily_totals.calories_kcal,
             daily_totals.protein_g,
+            memory_suffix,
             llm_resp.content
         ));
 

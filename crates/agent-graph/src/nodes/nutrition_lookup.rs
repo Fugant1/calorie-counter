@@ -6,7 +6,7 @@
 
 use crate::nodes::{
     compute_deterministic_embedding, AgentNode, GraphNodeError, NodeExecutionContext,
-    NodeExecutionResult,
+    NodeExecutionResult, WebResearcherNode,
 };
 use crate::state::{
     AgentHierarchyRole, GraphNodeId, GraphState, RagSourceType, ToolUsageRecord, VerifiedFoodItem,
@@ -75,14 +75,39 @@ impl AgentNode for NutritionLookupNode {
                     success: true,
                 });
 
-                let scaled = chunk.macros_per_100g.scaled_for_grams(entity.estimated_grams);
+                let resolved_grams = if entity.is_household_measure {
+                    let gt = chunk
+                        .resolve_household_grams(&entity.unit, entity.quantity)
+                        .or_else(|| {
+                            let table = WebResearcherNode::resolve_ground_truth_household_measures(
+                                &entity.canonical_key,
+                            );
+                            table
+                                .get(&entity.unit)
+                                .map(|per_u| (entity.quantity * per_u * 10.0).round() / 10.0)
+                        })
+                        .unwrap_or(entity.estimated_grams);
+                    if let Some(state_entity) = state
+                        .extracted_foods
+                        .iter_mut()
+                        .find(|e| e.entity_id == entity.entity_id)
+                    {
+                        state_entity.estimated_grams = gt;
+                        state_entity.household_grams_verified_from_ground_truth = true;
+                    }
+                    gt
+                } else {
+                    entity.estimated_grams
+                };
+
+                let scaled = chunk.macros_per_100g.scaled_for_grams(resolved_grams);
                 state.verified_items.push(VerifiedFoodItem {
                     entity_id: entity.entity_id.clone(),
                     canonical_key: entity.canonical_key.clone(),
                     display_name: entity.display_name.clone(),
                     quantity: entity.quantity,
                     unit: entity.unit.clone(),
-                    grams: entity.estimated_grams,
+                    grams: resolved_grams,
                     macros_per_100g: chunk.macros_per_100g.clone(),
                     scaled_macros: scaled,
                     confidence: 0.96,
@@ -126,14 +151,39 @@ impl AgentNode for NutritionLookupNode {
                     success: true,
                 });
 
-                let scaled = chunk.macros_per_100g.scaled_for_grams(entity.estimated_grams);
+                let resolved_grams = if entity.is_household_measure {
+                    let gt = chunk
+                        .resolve_household_grams(&entity.unit, entity.quantity)
+                        .or_else(|| {
+                            let table = WebResearcherNode::resolve_ground_truth_household_measures(
+                                &entity.canonical_key,
+                            );
+                            table
+                                .get(&entity.unit)
+                                .map(|per_u| (entity.quantity * per_u * 10.0).round() / 10.0)
+                        })
+                        .unwrap_or(entity.estimated_grams);
+                    if let Some(state_entity) = state
+                        .extracted_foods
+                        .iter_mut()
+                        .find(|e| e.entity_id == entity.entity_id)
+                    {
+                        state_entity.estimated_grams = gt;
+                        state_entity.household_grams_verified_from_ground_truth = true;
+                    }
+                    gt
+                } else {
+                    entity.estimated_grams
+                };
+
+                let scaled = chunk.macros_per_100g.scaled_for_grams(resolved_grams);
                 state.verified_items.push(VerifiedFoodItem {
                     entity_id: entity.entity_id.clone(),
                     canonical_key: entity.canonical_key.clone(),
                     display_name: entity.display_name.clone(),
                     quantity: entity.quantity,
                     unit: entity.unit.clone(),
-                    grams: entity.estimated_grams,
+                    grams: resolved_grams,
                     macros_per_100g: chunk.macros_per_100g.clone(),
                     scaled_macros: scaled,
                     confidence: 0.90,
