@@ -16,6 +16,7 @@
 //!   and tracks token consumption, latency, tool calls, loop guards, and decision paths.
 
 pub mod edges;
+pub mod llm_config;
 pub mod nodes;
 pub mod state;
 pub mod workflows;
@@ -326,13 +327,20 @@ impl HarnessInterceptor for CostAndTokenHarness {
         } else {
             next_state.telemetry.real_api_tokens_consumed += usage.total_tokens;
         }
+        let node_llm_cfg = ctx.llm_config.config_for_node(node_id);
+        let configured_model_id = if downgraded {
+            active_tier.default_model_id().to_string()
+        } else {
+            node_llm_cfg.model_id
+        };
+
         next_state.telemetry.total_latency_ms += recorded_latency_ms;
         next_state.telemetry.node_metrics.push(NodeExecutionMetric {
             step_index: next_state.step_index,
             node_id,
             hierarchy_role: node.hierarchy_role(),
             model_tier: active_tier,
-            model_id: active_tier.default_model_id().to_string(),
+            model_id: configured_model_id,
             downgraded_by_harness: downgraded,
             is_mock_model: result.is_mock_model,
             token_usage: usage,
@@ -469,6 +477,139 @@ impl GraphExecutor {
         let mut resumed_state = checkpoint.state_snapshot;
         resumed_state.current_node = checkpoint.next_node;
         self.run_state(resumed_state).await
+    }
+
+    /// Parses a `.pdf` or `.txt` nutrition plan file, stores user profile facts and probable daily
+    /// foods in Semantic/Episodic `ConversationMemoryStore`, and pre-warms the `RagNutritionCacheStore`
+    /// with all primary foods and calorie exchange options from the plan.
+    pub fn ingest_nutrition_plan_file(
+        &self,
+        user_id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<shared_types::ParsedNutritionPlan, shared_types::SharedDomainError> {
+        let plan =
+            shared_types::NutritionPlanDocumentReader::parse_nutrition_plan(user_id, filename, bytes)?;
+
+        // 1. Update Semantic Memory with user profile, targets, probable daily foods, and exchanges
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "active_plan_id".to_string(),
+            plan.plan_id.clone(),
+        );
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "active_plan_title".to_string(),
+            plan.title.clone(),
+        );
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "daily_calorie_target_kcal".to_string(),
+            format!("{:.0}", plan.target_daily_macros.calories_kcal),
+        );
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "daily_protein_target_g".to_string(),
+            format!("{:.0}", plan.target_daily_macros.protein_g),
+        );
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "daily_carbs_target_g".to_string(),
+            format!("{:.0}", plan.target_daily_macros.carbs_g),
+        );
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "daily_fat_target_g".to_string(),
+            format!("{:.0}", plan.target_daily_macros.fat_g),
+        );
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "hydration_target_ml".to_string(),
+            plan.hydration_target_ml.to_string(),
+        );
+
+        if let Some(full_name) = &plan.extracted_user_profile.full_name {
+            self.context.memory_store.upsert_semantic_fact(
+                user_id,
+                "user_full_name".to_string(),
+                full_name.clone(),
+            );
+        }
+        if let Some(cpf) = &plan.extracted_user_profile.cpf {
+            self.context.memory_store.upsert_semantic_fact(
+                user_id,
+                "user_cpf".to_string(),
+                cpf.clone(),
+            );
+        }
+
+        let probable_foods_list = plan
+            .probable_daily_foods
+            .iter()
+            .map(|f| format!("{} ({:.0}g)", f.display_name, f.estimated_grams))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.context.memory_store.upsert_semantic_fact(
+            user_id,
+            "probable_daily_foods".to_string(),
+            probable_foods_list,
+        );
+
+        if let Ok(json) = serde_json::to_string(&plan.probable_daily_foods) {
+            self.context.memory_store.upsert_semantic_fact(
+                user_id,
+                "probable_daily_foods_json".to_string(),
+                json,
+            );
+        }
+
+        // 2. Record Episodic Memory event
+        self.context.memory_store.store_episodic_event(
+            user_id,
+            format!(
+                "Nutrition plan '{}' ({}) loaded: target {:.0} kcal, {} probable daily foods, {} calorie exchanges",
+                plan.title,
+                plan.source_format.as_str(),
+                plan.target_daily_macros.calories_kcal,
+                plan.probable_daily_foods.len(),
+                plan.calorie_exchange_options.len()
+            ),
+        );
+
+        // 3. Pre-warm Redis L1/L2 RAG Cache with all probable daily foods from the plan
+        for food in &plan.probable_daily_foods {
+            let macros_100g = shared_types::lookup_reference_macros_per_100g(&food.canonical_key);
+            let chunk = crate::state::RagDocumentChunk {
+                chunk_id: format!("rag-plan-{}", food.food_id),
+                canonical_food_key: food.canonical_key.clone(),
+                display_name: food.display_name.clone(),
+                barcode_ean: None,
+                source_type: crate::state::RagSourceType::PostgresHybridRag,
+                source_url: format!("nutrition-plan://{}/{}", plan.plan_id, food.canonical_key),
+                content_markdown: format!(
+                    "{}: {:.1} kcal/100g (from nutritionist plan '{}')",
+                    food.display_name, macros_100g.calories_kcal, plan.title
+                ),
+                macros_per_100g: crate::state::MacroNutrients {
+                    calories_kcal: macros_100g.calories_kcal,
+                    protein_g: macros_100g.protein_g,
+                    carbs_g: macros_100g.carbs_g,
+                    fat_g: macros_100g.fat_g,
+                    fiber_g: macros_100g.fiber_g,
+                    sugar_g: 0.5,
+                    sodium_mg: 45.0,
+                },
+                household_measures_grams:
+                    crate::nodes::WebResearcherNode::resolve_ground_truth_household_measures(
+                        &food.canonical_key,
+                    ),
+                embedding: crate::nodes::compute_deterministic_embedding(&food.canonical_key),
+                relevance_score: 0.98,
+            };
+            self.context.rag_cache.ingest_and_cache(chunk);
+        }
+
+        Ok(plan)
     }
 }
 
@@ -639,6 +780,28 @@ mod tests {
         assert!(state_pt_audio.meal_registration.is_some());
         assert!(state_pt_audio.coaching_notes.is_some());
         assert_eq!(state_pt_audio.telemetry.real_api_tokens_consumed, 0);
+
+        // 4. Verify plural Portuguese units ("Comi 3 ovos cozidos com 2 pães de forma")
+        // convert to 165g of egg (3 * 55g) and 50g of sliced bread (2 * 25g), NOT 300g and 200g!
+        let pt_eggs_bread = GraphInput::text("Comi 3 ovos cozidos com 2 pães de forma");
+        let state_eggs_bread = executor
+            .run("usuario-carlos", "conv-pt-eggs-bread", pt_eggs_bread)
+            .await
+            .expect("Portuguese eggs + sliced bread meal should succeed");
+        assert_eq!(state_eggs_bread.extracted_foods.len(), 2);
+        let egg_entity = state_eggs_bread
+            .extracted_foods
+            .iter()
+            .find(|e| e.canonical_key == "egg")
+            .expect("Should canonicalize 'ovos cozidos' to 'egg'");
+        assert_eq!(egg_entity.estimated_grams, 165.0);
+
+        let bread_entity = state_eggs_bread
+            .extracted_foods
+            .iter()
+            .find(|e| e.canonical_key == "whole_wheat_bread")
+            .expect("Should canonicalize 'pães de forma' to 'whole_wheat_bread'");
+        assert_eq!(bread_entity.estimated_grams, 50.0);
     }
 
     #[tokio::test]
@@ -1046,5 +1209,161 @@ mod tests {
             .iter()
             .any(|w| w.contains("non-UTF8")));
         assert!(audio_state.meal_registration.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pdf_and_txt_nutrition_plan_ingestion_updates_memory_and_prewarms_rag_cache() {
+        let executor = GraphExecutor::with_defaults();
+
+        let pdf_bytes = shared_types::NutritionPlanDocumentReader::build_pdf_document_from_text(&[
+            "Plano Alimentar: Hipertrofia Avancada",
+            "Nutricionista: Dr. Eduardo Rocha - CRN-3 55110",
+            "Paciente: Marcos Vinicius",
+            "CPF: 555.444.333-22",
+            "Meta: 2500 kcal | Proteina: 190g | Carboidratos: 280g | Gordura: 70g",
+            "Hidratacao: 3500 ml",
+            "08:00 - Cafe da Manha",
+            "- 3 unidades de Ovos Mexidos (150g) OU 30g de Whey Protein",
+            "- 60g de Aveia OU 70g de Tapioca",
+            "13:00 - Almoco",
+            "- 200g de Peito de Frango Grelhado OU 220g de Tilapia",
+            "- 150g de Batata Doce Cozida OU 140g de Arroz Integral",
+        ]);
+
+        let parsed = executor
+            .ingest_nutrition_plan_file("user-marcos", "plano_marcos.pdf", &pdf_bytes)
+            .expect("PDF nutrition plan ingestion should succeed");
+
+        assert_eq!(parsed.probable_daily_foods.len(), 4);
+        assert_eq!(parsed.calorie_exchange_options.len(), 4);
+
+        // Verify Semantic Memory was updated with user profile & probable daily foods
+        let profile = executor
+            .context()
+            .memory_store
+            .get_user_semantic_profile("user-marcos");
+        assert_eq!(
+            profile.get("daily_calorie_target_kcal").map(String::as_str),
+            Some("2500")
+        );
+        assert_eq!(
+            profile.get("daily_protein_target_g").map(String::as_str),
+            Some("190")
+        );
+        assert_eq!(
+            profile.get("user_full_name").map(String::as_str),
+            Some("Marcos Vinicius")
+        );
+        assert_eq!(
+            profile.get("user_cpf").map(String::as_str),
+            Some("555.444.333-22")
+        );
+        assert!(profile
+            .get("probable_daily_foods")
+            .expect("probable_daily_foods must be saved in memory")
+            .contains("Peito de Frango Grelhado"));
+
+        // Now when Marcos logs his lunch from the probable daily foods, it hits the pre-warmed RAG cache directly!
+        let state = executor
+            .run(
+                "user-marcos",
+                "conv-marcos-1",
+                GraphInput::text("Almocei 200g de peito de frango grelhado e 150g de batata doce cozida"),
+            )
+            .await
+            .expect("Meal registration after PDF plan ingestion should succeed");
+
+        assert_eq!(state.cache_hit_keys.len(), 2);
+        assert!(state.newly_populated_rag_cache_keys.is_empty());
+        assert_eq!(state.telemetry.real_api_tokens_consumed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_llm_json_meal_parser_typo_correction_and_ground_truth_household_measures() {
+        // 1. Verify the per-node LLM configuration file (`config/node_llm_config.json`) loads cleanly
+        // and configures `MealParser` with a small JSON-mode LLM (`qwen2.5-1.5b-instruct-json`).
+        let registry = crate::llm_config::NodeLlmConfigRegistry::from_json_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config/node_llm_config.json"),
+        )
+        .expect("config/node_llm_config.json should load and validate");
+
+        let meal_parser_cfg = registry.config_for_node(GraphNodeId::MealParser);
+        assert_eq!(meal_parser_cfg.model_id, "qwen2.5-1.5b-instruct-json");
+        assert_eq!(meal_parser_cfg.response_format, "json_object");
+        assert_eq!(meal_parser_cfg.model_tier, ModelTier::Tier1FastNano);
+
+        // 2. Verify the small LLM JSON output resolves severe user typos ("ovio", "ovoos", "paes de forna", "colhr de sopa")
+        let executor = GraphExecutor::with_defaults();
+        let noisy_input = GraphInput::text(
+            "Comi 3 ovio cozidos e 2 ovoos mexidos com 2 paes de forna e 1 colhr de sopa de azeite",
+        );
+
+        let state = executor
+            .run("user-typo-test", "conv-typo-1", noisy_input)
+            .await
+            .expect("Typo-heavy meal log should be parsed via small LLM JSON and verified");
+
+        assert_eq!(state.extracted_foods.len(), 4);
+
+        // Item 1: "3 ovio cozidos" -> canonical_key="egg", typo_corrected_from=Some("ovio -> ovo"), 165.0g verified from ground truth
+        let first_egg = &state.extracted_foods[0];
+        assert_eq!(first_egg.canonical_key, "egg");
+        assert!(first_egg.is_household_measure);
+        assert!(first_egg.household_grams_verified_from_ground_truth);
+        assert_eq!(first_egg.estimated_grams, 165.0);
+        assert!(first_egg
+            .typo_corrected_from
+            .as_deref()
+            .unwrap_or("")
+            .contains("ovio -> ovo"));
+
+        // Item 2: "2 ovoos mexidos" -> canonical_key="egg", typo_corrected_from=Some("ovoos -> ovos"), 110.0g verified from ground truth
+        let second_egg = &state.extracted_foods[1];
+        assert_eq!(second_egg.canonical_key, "egg");
+        assert!(second_egg.is_household_measure);
+        assert!(second_egg.household_grams_verified_from_ground_truth);
+        assert_eq!(second_egg.estimated_grams, 110.0);
+        assert!(second_egg
+            .typo_corrected_from
+            .as_deref()
+            .unwrap_or("")
+            .contains("ovoos -> ovos"));
+
+        // Item 3: "2 paes de forna" -> canonical_key="whole_wheat_bread", typo_corrected_from=Some("forna -> forma"), 50.0g verified from ground truth
+        let bread = &state.extracted_foods[2];
+        assert_eq!(bread.canonical_key, "whole_wheat_bread");
+        assert!(bread.is_household_measure);
+        assert!(bread.household_grams_verified_from_ground_truth);
+        assert_eq!(bread.estimated_grams, 50.0);
+        assert!(bread
+            .typo_corrected_from
+            .as_deref()
+            .unwrap_or("")
+            .contains("forna -> forma"));
+
+        // Item 4: "1 colhr de sopa de azeite" -> unit="tbsp", canonical_key="olive_oil", 14.0g verified from ground truth
+        let oil = &state.extracted_foods[3];
+        assert_eq!(oil.canonical_key, "olive_oil");
+        assert_eq!(oil.unit, "tbsp");
+        assert!(oil.is_household_measure);
+        assert!(oil.household_grams_verified_from_ground_truth);
+        assert_eq!(oil.estimated_grams, 14.0);
+
+        // Verify that the Harness recorded `qwen2.5-1.5b-instruct-json` for MealParser
+        let mp_metric = state
+            .telemetry
+            .node_metrics
+            .iter()
+            .find(|m| m.node_id == GraphNodeId::MealParser)
+            .expect("MealParser node metric must be recorded");
+        assert_eq!(mp_metric.model_id, "qwen2.5-1.5b-instruct-json");
+
+        // Verify that WebSearchAndRAG executed `household_measure_ground_truth_web_search`
+        assert!(state
+            .telemetry
+            .tool_usage_log
+            .iter()
+            .any(|t| t.tool_name == "household_measure_ground_truth_web_search"));
     }
 }

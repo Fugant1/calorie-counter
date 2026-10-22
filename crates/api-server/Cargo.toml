@@ -7,4 +7,10 @@ license.workspace = true
 [dependencies]
 agent-graph.workspace = true
 agent-harness.workspace = true
+db-postgres.workspace = true
+hex.workspace = true
+memory-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 shared-types.workspace = true
+tokio.workspace = true

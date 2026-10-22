@@ -291,9 +291,19 @@ pub struct FoodEntity {
     pub barcode_ean: Option<String>,
     pub quantity: f32,
     pub unit: String,
-    /// Estimated weight in grams for macro scaling.
+    /// Estimated weight in grams for macro scaling (refined from ground-truth web search / RAG when `is_household_measure` is true).
     pub estimated_grams: f32,
     pub preparation: Option<String>,
+    /// `true` when the user specified a household or countable unit (e.g., `"3 ovos"`, `"2 fatias"`, `"1 colher de sopa"`, `"1 concha"`)
+    /// rather than an explicit weighed amount (`g`, `kg`, `ml`, `oz`).
+    #[serde(default)]
+    pub is_household_measure: bool,
+    /// `true` once the household measure gram weight has been verified against ground-truth (TACO/IBGE/USDA web search or RAG cache).
+    #[serde(default)]
+    pub household_grams_verified_from_ground_truth: bool,
+    /// Original misspelled token if the LLM JSON meal parser corrected a typo (e.g., `"ovio"` or `"ovoos"` -> `"ovo"`).
+    #[serde(default)]
+    pub typo_corrected_from: Option<String>,
 }
 
 /// Macro and key micronutrient breakdown (either per 100g or scaled to a serving).
@@ -380,9 +390,33 @@ pub struct RagDocumentChunk {
     pub source_url: String,
     pub content_markdown: String,
     pub macros_per_100g: MacroNutrients,
+    /// Ground-truth household measure conversions in grams per 1 unit (e.g., `"unit" -> 55.0`, `"tbsp" -> 14.0`, `"slice" -> 25.0`, `"concha" -> 100.0`)
+    /// scraped from TACO / IBGE Tabela de Medidas Caseiras / USDA FoodData Central.
+    #[serde(default)]
+    pub household_measures_grams: BTreeMap<String, f32>,
     /// Compact dense embedding vector used for semantic similarity lookup in RAG cache.
     pub embedding: Vec<f32>,
     pub relevance_score: f32,
+}
+
+impl RagDocumentChunk {
+    /// Resolves total grams for `quantity` of `unit` using this chunk's ground-truth household measure table.
+    pub fn resolve_household_grams(&self, unit: &str, quantity: f32) -> Option<f32> {
+        let per_unit = self
+            .household_measures_grams
+            .get(unit)
+            .or_else(|| {
+                if unit == "serving" {
+                    self.household_measures_grams.get("unit")
+                } else if unit == "unit" {
+                    self.household_measures_grams.get("serving")
+                } else {
+                    None
+                }
+            })
+            .copied()?;
+        Some(round_one_decimal(quantity * per_unit))
+    }
 }
 
 /// Verified food item with scaled macros ready for registration by the Executioner.

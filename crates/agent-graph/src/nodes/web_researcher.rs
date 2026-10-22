@@ -14,6 +14,7 @@ use crate::state::{
 };
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// **ToolCaller** node that performs massive web search fan-out, builds RAG chunks,
@@ -155,6 +156,24 @@ impl WebResearcherNode {
                 },
                 RagSourceType::UsdaFoodDataCentral,
                 "https://taco.unicamp.br/tabela-nutricional/pao-de-queijo-assado",
+            )
+        } else if key.contains("whole_wheat_bread")
+            || key.contains("pao_forma")
+            || key.contains("paes_forma")
+            || key.contains("pao_integral")
+        {
+            (
+                MacroNutrients {
+                    calories_kcal: 253.0,
+                    protein_g: 9.4,
+                    carbs_g: 46.5,
+                    fat_g: 3.3,
+                    fiber_g: 5.8,
+                    sugar_g: 3.2,
+                    sodium_mg: 440.0,
+                },
+                RagSourceType::UsdaFoodDataCentral,
+                "https://taco.unicamp.br/tabela-nutricional/pao-de-forma-integral",
             )
         } else if key.contains("pao_frances") {
             (
@@ -350,6 +369,82 @@ impl WebResearcherNode {
         (macros, source, url)
     }
 
+    /// Resolves ground-truth household measure conversions (in grams per 1 unit) from TACO,
+    /// IBGE Tabela de Medidas Referidas para os Alimentos Consumidos no Brasil, and USDA FoodData Central.
+    pub fn resolve_ground_truth_household_measures(canonical_key: &str) -> BTreeMap<String, f32> {
+        let mut map = BTreeMap::from([
+            ("g".to_string(), 1.0),
+            ("kg".to_string(), 1_000.0),
+            ("ml".to_string(), 1.0),
+            ("oz".to_string(), 28.35),
+            ("tbsp".to_string(), 14.0),
+            ("tsp".to_string(), 5.0),
+            ("cup".to_string(), 200.0),
+            ("slice".to_string(), 30.0),
+            ("scoop".to_string(), 32.0),
+            ("concha".to_string(), 100.0),
+            ("escumadeira".to_string(), 90.0),
+            ("piece".to_string(), 60.0),
+            ("bowl".to_string(), 250.0),
+            ("small".to_string(), 100.0),
+            ("medium".to_string(), 120.0),
+            ("large".to_string(), 180.0),
+            ("unit".to_string(), 100.0),
+            ("serving".to_string(), 100.0),
+        ]);
+
+        if canonical_key.contains("egg") || canonical_key.contains("ovo") {
+            map.insert("unit".to_string(), 55.0);
+            map.insert("serving".to_string(), 55.0);
+            map.insert("small".to_string(), 45.0);
+            map.insert("medium".to_string(), 50.0);
+            map.insert("large".to_string(), 60.0);
+        } else if canonical_key.contains("whole_wheat_bread")
+            || canonical_key.contains("pao_forma")
+            || canonical_key.contains("paes_forma")
+            || canonical_key.contains("pao_integral")
+        {
+            map.insert("unit".to_string(), 25.0);
+            map.insert("serving".to_string(), 25.0);
+            map.insert("slice".to_string(), 25.0);
+        } else if canonical_key.contains("pao_frances") {
+            map.insert("unit".to_string(), 50.0);
+            map.insert("serving".to_string(), 50.0);
+            map.insert("slice".to_string(), 25.0);
+        } else if canonical_key.contains("pao_de_queijo") {
+            map.insert("unit".to_string(), 40.0);
+            map.insert("serving".to_string(), 40.0);
+            map.insert("small".to_string(), 25.0);
+            map.insert("medium".to_string(), 40.0);
+            map.insert("large".to_string(), 70.0);
+        } else if canonical_key.contains("sweet_potato") || canonical_key.contains("batata_doce") {
+            map.insert("unit".to_string(), 130.0);
+            map.insert("serving".to_string(), 130.0);
+            map.insert("medium".to_string(), 130.0);
+            map.insert("small".to_string(), 90.0);
+            map.insert("large".to_string(), 180.0);
+        } else if canonical_key.contains("banana") {
+            map.insert("unit".to_string(), 100.0);
+            map.insert("serving".to_string(), 100.0);
+            map.insert("small".to_string(), 75.0);
+            map.insert("medium".to_string(), 118.0);
+            map.insert("large".to_string(), 135.0);
+        } else if canonical_key.contains("tapioca") {
+            map.insert("unit".to_string(), 80.0);
+            map.insert("serving".to_string(), 80.0);
+            map.insert("tbsp".to_string(), 20.0);
+        } else if canonical_key.contains("chicken")
+            || canonical_key.contains("salmon")
+            || canonical_key.contains("tilapia")
+        {
+            map.insert("unit".to_string(), 120.0);
+            map.insert("serving".to_string(), 120.0);
+            map.insert("piece".to_string(), 120.0);
+        }
+
+        map
+    }
+
     pub fn compute_query_hash(query: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(query.as_bytes());
@@ -367,6 +462,7 @@ impl AgentNode for WebResearcherNode {
         &[
             "searxng_web_search_fanout",
             "html_nutrition_table_extractor",
+            "household_measure_ground_truth_web_search",
             "rag_ingest_and_redis_cache_writeback",
             "singleflight_race_coalesced_cache_hit",
         ]
@@ -423,16 +519,33 @@ impl AgentNode for WebResearcherNode {
                         success: true,
                     });
 
+                    let resolved_grams = if entity.is_household_measure {
+                        let gt_grams = cached_chunk
+                            .resolve_household_grams(&entity.unit, entity.quantity)
+                            .unwrap_or(entity.estimated_grams);
+                        if let Some(state_entity) = state
+                            .extracted_foods
+                            .iter_mut()
+                            .find(|e| e.entity_id == entity.entity_id)
+                        {
+                            state_entity.estimated_grams = gt_grams;
+                            state_entity.household_grams_verified_from_ground_truth = true;
+                        }
+                        gt_grams
+                    } else {
+                        entity.estimated_grams
+                    };
+
                     let scaled = cached_chunk
                         .macros_per_100g
-                        .scaled_for_grams(entity.estimated_grams);
+                        .scaled_for_grams(resolved_grams);
                     state.verified_items.push(VerifiedFoodItem {
                         entity_id: entity.entity_id.clone(),
                         canonical_key: entity.canonical_key.clone(),
                         display_name: entity.display_name.clone(),
                         quantity: entity.quantity,
                         unit: entity.unit.clone(),
-                        grams: entity.estimated_grams,
+                        grams: resolved_grams,
                         macros_per_100g: cached_chunk.macros_per_100g.clone(),
                         scaled_macros: scaled,
                         confidence: 0.95,
@@ -526,6 +639,8 @@ impl AgentNode for WebResearcherNode {
 
             let chunk_id = format!("rag-chunk-{}", &Uuid::new_v4().to_string()[..8]);
             let embedding = compute_deterministic_embedding(&entity.canonical_key);
+            let household_measures_grams =
+                Self::resolve_ground_truth_household_measures(&entity.canonical_key);
 
             let rag_chunk = RagDocumentChunk {
                 chunk_id: chunk_id.clone(),
@@ -536,8 +651,50 @@ impl AgentNode for WebResearcherNode {
                 source_url: source_url.clone(),
                 content_markdown: markdown_chunk,
                 macros_per_100g: macros_100g.clone(),
+                household_measures_grams,
                 embedding,
                 relevance_score: if retry_iter > 0 { 0.95 } else { 0.91 },
+            };
+
+            // If the user specified a household measure (e.g. "3 ovos", "2 pães de forma", "1 colher de sopa"),
+            // resolve the exact gram weight from the ground-truth TACO/IBGE/USDA household measure table.
+            let resolved_grams = if entity.is_household_measure {
+                let gt_grams = rag_chunk
+                    .resolve_household_grams(&entity.unit, entity.quantity)
+                    .unwrap_or(entity.estimated_grams);
+
+                if let Some(state_entity) = state
+                    .extracted_foods
+                    .iter_mut()
+                    .find(|e| e.entity_id == entity.entity_id)
+                {
+                    state_entity.estimated_grams = gt_grams;
+                    state_entity.household_grams_verified_from_ground_truth = true;
+                }
+
+                state.record_tool_call(ToolUsageRecord {
+                    call_id: Uuid::new_v4().to_string(),
+                    step_index: state.step_index,
+                    caller_node: GraphNodeId::WebSearchAndRAG,
+                    hierarchy_role: AgentHierarchyRole::ToolCaller,
+                    tool_name: "household_measure_ground_truth_web_search".to_string(),
+                    input_summary: format!(
+                        "food='{}' qty={} unit='{}'",
+                        entity.canonical_key, entity.quantity, entity.unit
+                    ),
+                    output_summary: format!(
+                        "Ground-truth household measure resolved: {} {} of '{}' = {:.1}g (source={})",
+                        entity.quantity, entity.unit, entity.display_name, gt_grams, source_url
+                    ),
+                    cache_hit: Some(false),
+                    latency_ms: 9,
+                    tokens_used: 0,
+                    success: true,
+                });
+
+                gt_grams
+            } else {
+                entity.estimated_grams
             };
 
             state.record_tool_call(ToolUsageRecord {
@@ -587,14 +744,14 @@ impl AgentNode for WebResearcherNode {
                 _ => rag_chunk.relevance_score,
             };
 
-            let scaled_macros = macros_100g.scaled_for_grams(entity.estimated_grams);
+            let scaled_macros = macros_100g.scaled_for_grams(resolved_grams);
             let verified_item = VerifiedFoodItem {
                 entity_id: entity.entity_id.clone(),
                 canonical_key: entity.canonical_key.clone(),
                 display_name: entity.display_name.clone(),
                 quantity: entity.quantity,
                 unit: entity.unit.clone(),
-                grams: entity.estimated_grams,
+                grams: resolved_grams,
                 macros_per_100g: macros_100g,
                 scaled_macros,
                 confidence: item_confidence,
@@ -630,6 +787,7 @@ impl AgentNode for WebResearcherNode {
 
         state.cache_miss_keys.clear();
         state.mark_planned_tool_completed("web_search_fanout_and_rag_ingest");
+        state.mark_planned_tool_completed("household_measure_ground_truth_lookup");
 
         Ok(NodeExecutionResult::new(
             state,

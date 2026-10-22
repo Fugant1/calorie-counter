@@ -18,6 +18,7 @@ pub use meal_parser::MealParserNode;
 pub use nutrition_lookup::NutritionLookupNode;
 pub use web_researcher::WebResearcherNode;
 
+use crate::llm_config::NodeLlmConfigRegistry;
 use crate::state::{
     AgentHierarchyRole, DetectedLanguage, GraphNodeId, GraphState, MacroNutrients,
     MealRegistration, ModelTier, RagDocumentChunk, RagSourceType,
@@ -202,6 +203,9 @@ impl LlmModelProvider for MockLlmModelProvider {
         };
 
         let content = match (request.node_id, request.language) {
+            (GraphNodeId::MealParser, _) => {
+                MealParserNode::simulate_small_llm_json_extraction(&request.user_prompt)
+            }
             (GraphNodeId::IntentRouter, DetectedLanguage::Portuguese) => {
                 "MOCK_PT_INTENT_ROUTED: Intenção classificada e plano hierárquico criado.".to_string()
             }
@@ -591,13 +595,15 @@ impl ConversationMemoryStore for InMemoryConversationMemoryStore {
 
 /// Shared execution context passed to every `AgentNode` during graph execution.
 ///
-/// Uses `MockLlmModelProvider` by default so testing never consumes external API tokens.
+/// Uses `MockLlmModelProvider` by default so testing never consumes external API tokens,
+/// and loads per-node model configurations from `config/node_llm_config.json`.
 #[derive(Clone)]
 pub struct NodeExecutionContext {
     pub rag_cache: Arc<dyn RagNutritionCacheStore>,
     pub calorie_ledger: Arc<dyn CalorieCounterLedgerStore>,
     pub memory_store: Arc<dyn ConversationMemoryStore>,
     pub llm_provider: Arc<dyn LlmModelProvider>,
+    pub llm_config: Arc<NodeLlmConfigRegistry>,
 }
 
 impl Default for NodeExecutionContext {
@@ -607,6 +613,7 @@ impl Default for NodeExecutionContext {
             calorie_ledger: Arc::new(InMemoryCalorieLedgerStore::new()),
             memory_store: Arc::new(InMemoryConversationMemoryStore::new()),
             llm_provider: Arc::new(MockLlmModelProvider::new()),
+            llm_config: Arc::new(NodeLlmConfigRegistry::default()),
         }
     }
 }
@@ -622,11 +629,17 @@ impl NodeExecutionContext {
             calorie_ledger,
             memory_store,
             llm_provider: Arc::new(MockLlmModelProvider::new()),
+            llm_config: Arc::new(NodeLlmConfigRegistry::default()),
         }
     }
 
     pub fn with_llm_provider(mut self, llm_provider: Arc<dyn LlmModelProvider>) -> Self {
         self.llm_provider = llm_provider;
+        self
+    }
+
+    pub fn with_llm_config(mut self, llm_config: Arc<NodeLlmConfigRegistry>) -> Self {
+        self.llm_config = llm_config;
         self
     }
 }
@@ -684,8 +697,8 @@ pub fn normalize_food_key(raw: &str) -> String {
     canonicalize_bilingual_food_alias(&joined)
 }
 
-/// Maps common Portuguese and English food synonyms to unified canonical keys so that
-/// RAG cache entries are shared seamlessly across Portuguese and English queries.
+/// Maps common Portuguese and English food synonyms (including plural and preparation variants)
+/// to unified canonical keys so that RAG cache entries and unit-to-gram weights are consistent.
 pub fn canonicalize_bilingual_food_alias(key: &str) -> String {
     match key {
         "peito_frango_grelhado"
@@ -693,6 +706,7 @@ pub fn canonicalize_bilingual_food_alias(key: &str) -> String {
         | "peito_frango"
         | "file_frango_grelhado"
         | "file_peito_frango"
+        | "files_frango"
         | "grilled_chicken_breast"
         | "chicken_breast" => "grilled_chicken_breast".to_string(),
 
@@ -701,35 +715,66 @@ pub fn canonicalize_bilingual_food_alias(key: &str) -> String {
         }
 
         "batata_doce"
+        | "batatas_doces"
         | "batata_doce_cozida"
         | "batata_doce_assada"
-        | "sweet_potato" => "sweet_potato".to_string(),
+        | "sweet_potato"
+        | "sweet_potatoes" => "sweet_potato".to_string(),
 
         "salmao" | "salmao_grelhado" | "salmon" | "grilled_salmon" => "salmon".to_string(),
 
         "arroz_branco" | "arroz_cozido" | "arroz" | "white_rice" | "rice" => "rice".to_string(),
 
-        "arroz_integral" | "brown_rice" => "brown_rice".to_string(),
+        "arroz_integral" | "arroz_integral_cozido" | "brown_rice" => "brown_rice".to_string(),
 
         "feijao" | "feijao_carioca" | "feijao_preto" | "feijao_cozido" | "black_beans" | "beans" => {
             "feijao".to_string()
         }
 
-        "ovo" | "ovos" | "ovo_cozido" | "ovo_mexido" | "ovo_frito" | "egg" | "eggs" | "boiled_egg" => {
-            "egg".to_string()
-        }
+        "ovo"
+        | "ovos"
+        | "ovo_cozido"
+        | "ovos_cozidos"
+        | "ovo_mexido"
+        | "ovos_mexidos"
+        | "ovo_frito"
+        | "ovos_fritos"
+        | "egg"
+        | "eggs"
+        | "boiled_egg"
+        | "boiled_eggs"
+        | "scrambled_egg"
+        | "scrambled_eggs"
+        | "fried_egg"
+        | "fried_eggs" => "egg".to_string(),
 
         "aveia" | "flocos_aveia" | "farinha_aveia" | "mingau_aveia" | "oats" | "oatmeal" | "rolled_oats" => {
             "oats".to_string()
         }
 
-        "banana" | "banana_prata" | "banana_nanica" => "banana".to_string(),
+        "banana" | "bananas" | "banana_prata" | "banana_nanica" => "banana".to_string(),
 
-        "abacate" | "avocado" => "avocado".to_string(),
+        "abacate" | "abacates" | "avocado" | "avocados" => "avocado".to_string(),
 
-        "pao_queijo" | "pao_de_queijo" | "cheese_bread" => "pao_de_queijo".to_string(),
+        "pao_queijo" | "paes_queijo" | "pao_de_queijo" | "paes_de_queijo" | "cheese_bread" => {
+            "pao_de_queijo".to_string()
+        }
 
-        "pao_frances" | "pao_sal" | "french_bread" => "pao_frances".to_string(),
+        "pao_forma"
+        | "paes_forma"
+        | "pao_de_forma"
+        | "paes_de_forma"
+        | "pao_integral"
+        | "paes_integrais"
+        | "pao_forma_integral"
+        | "paes_forma_integral"
+        | "whole_wheat_bread"
+        | "sliced_bread"
+        | "bread_slice" => "whole_wheat_bread".to_string(),
+
+        "pao_frances" | "paes_franceses" | "pao_sal" | "pao" | "paes" | "french_bread" | "bread" => {
+            "pao_frances".to_string()
+        }
 
         "tapioca" | "goma_tapioca" | "beiju" => "tapioca".to_string(),
 
@@ -745,7 +790,19 @@ pub fn canonicalize_bilingual_food_alias(key: &str) -> String {
 
         "whey" | "whey_protein" | "proteina_isolada" | "shake_whey" => "whey_protein".to_string(),
 
-        other => other.to_string(),
+        other => {
+            if other.starts_with("ovo_") || other.starts_with("ovos_") || other.ends_with("_egg") || other.ends_with("_eggs") {
+                "egg".to_string()
+            } else if other.contains("pao_forma") || other.contains("paes_forma") || other.contains("pao_integral") || other.contains("paes_integrais") {
+                "whole_wheat_bread".to_string()
+            } else if other.contains("pao_queijo") || other.contains("paes_queijo") {
+                "pao_de_queijo".to_string()
+            } else if other.contains("pao_frances") || other.contains("paes_franceses") {
+                "pao_frances".to_string()
+            } else {
+                other.to_string()
+            }
+        }
     }
 }
 
